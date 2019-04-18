@@ -55,7 +55,7 @@ namespace FunctionsBuildHelper
             var response = await _httpClient.SendAsync(request);
             if (!response.IsSuccessStatusCode)
             {
-                throw new InvalidOperationException("Boo: " + url);
+                throw new InvalidOperationException($"Boo: {url} {response.StatusCode}");
             }
 
             string json = await response.Content.ReadAsStringAsync();

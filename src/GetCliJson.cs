@@ -1,8 +1,10 @@
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
@@ -20,8 +22,6 @@ namespace FunctionsBuildHelper
     {
         private const string _cdnRoot = "https://functionscdn.azureedge.net/public";
         private const string _feedUrl = "https://raw.githubusercontent.com/Azure/azure-functions-tooling-feed/master/cli-feed-v3.json";
-        private const string _itemTemplateUrl = "https://www.myget.org/F/azure-appservice/api/v2/package/Azure.Functions.Templates/";
-        private const string _projTemplateUrl = "https://www.myget.org/F/azure-appservice/api/v2/package/Microsoft.AzureFunctions.ProjectTemplates/";
 
         // cache this since it's an expensive call
         private static ConcurrentDictionary<string, Task<string>> _templateVersionMap = new ConcurrentDictionary<string, Task<string>>();
@@ -52,12 +52,12 @@ namespace FunctionsBuildHelper
 
             // Figure out the build number, which will be in the file name.
             // example -- Azure.Functions.Cli.linux-x64.2.2.27.zip is 2.2.27
-            string winX86Zip = artifacts.Select(p => p.fileName).Single(p => p.Contains(".win-x86.") && p.EndsWith(".zip"));
+            string minWinX86Zip = artifacts.Select(p => p.fileName).Single(p => p.Contains("min.win-x86.") && p.EndsWith(".zip"));
 
             // Start the zip download, which will get us the template versions.
-            Task<string> downloadTask = DownloadAndExtractTemplateVersionAsync(jobId, winX86Zip);
+            Task<string> downloadTask = DownloadAndExtractTemplateVersionAsync(jobId, minWinX86Zip);
 
-            string version = winX86Zip.Split(".win-x86.")[1].Split(".zip")[0];
+            string version = minWinX86Zip.Split(".win-x86.")[1].Split(".zip")[0];
 
             // Loop through the zips
             List<CliEntry> entries = new List<CliEntry>();
@@ -66,7 +66,7 @@ namespace FunctionsBuildHelper
                 return $"{_cdnRoot}/{version}/{file.Replace("artifacts/", "")}";
             }
 
-            foreach (string file in artifacts.Select(p => p.fileName).Where(p => p.EndsWith(".zip") && !p.Contains(".no-runtime.")))
+            foreach (string file in artifacts.Select(p => p.fileName).Where(p => p.EndsWith(".zip") && !p.Contains(".no-runtime.") && !p.Contains(".min.")))
             {
                 var entry = new CliEntry
                 {
@@ -95,18 +95,33 @@ namespace FunctionsBuildHelper
             var feedEntry = mostRecentRelease.ToObject<FeedEntry>();
 
             // Now overwrite the new values that we've pulled
-            feedEntry.cli = GetDownloadLink(winX86Zip);
-            feedEntry.sha2 = await DownloadShaAsync(jobId, winX86Zip);
+            feedEntry.cli = GetDownloadLink(minWinX86Zip);
+            feedEntry.sha2 = await DownloadShaAsync(jobId, minWinX86Zip);
             feedEntry.standaloneCli = entries.ToArray();
 
             // This is pulling the template version directly from the zip file
             var templateVersion = await downloadTask;
-            feedEntry.itemTemplates = _itemTemplateUrl + templateVersion;
-            feedEntry.projectTemplates = _projTemplateUrl + templateVersion;
+
+            // Replace the version in the previous feedEntry with the one from the zip
+            string previousVersion = feedEntry.itemTemplates.Split("/").Last();
+            feedEntry.itemTemplates = feedEntry.itemTemplates.Replace(previousVersion, templateVersion);
+            feedEntry.projectTemplates = feedEntry.projectTemplates.Replace(previousVersion, templateVersion);
+
+            await EnsureExists(feedEntry.itemTemplates);
+            await EnsureExists(feedEntry.projectTemplates);
 
             JObject returnJson = JObject.FromObject(feedEntry, _serializer);
 
             return new OkObjectResult(returnJson);
+        }
+
+        private static async Task EnsureExists(string urlToCheck)
+        {
+            HttpResponseMessage response = await _client.GetAsync(urlToCheck);
+            if (response.StatusCode != HttpStatusCode.OK)
+            {
+                throw new InvalidOperationException($"{urlToCheck} returned {response.StatusCode}. '{await response.Content.ReadAsStringAsync()}'");
+            }
         }
 
         private static Task<string> DownloadAndExtractTemplateVersionAsync(string jobId, string winX86ZipPath)
