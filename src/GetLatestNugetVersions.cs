@@ -1,5 +1,5 @@
+using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -28,16 +28,18 @@ namespace FunctionsBuildHelper
             "Microsoft.Azure.WebJobs.Extensions.Storage",
             "Microsoft.Azure.WebJobs.Host.Storage",
             "Microsoft.Azure.WebJobs.Logging",
-            "Microsoft.Azure.WebJobs.Logging.ApplicationInsights"
+            "Microsoft.Azure.WebJobs.Logging.ApplicationInsights",
+            "Microsoft.NET.Sdk.Functions",
+            "Microsoft.Azure.Functions.Extensions",
+            "Microsoft.Azure.WebJobs.Script.ExtensionsMetadataGenerator"
         };
 
-        private static readonly IReadOnlyDictionary<string, string> nugetSources = new ReadOnlyDictionary<string, string>(
-            new Dictionary<string, string>
-            {
-                { "App Service Nightly", "https://www.myget.org/F/azure-appservice/api/v3/index.json" },
-                { "App Service Staging", "https://www.myget.org/F/azure-appservice-staging/api/v3/index.json" },
-                { "Nuget.org", "https://api.nuget.org/v3/index.json" }
-            });
+        private static readonly NugetRegistration[] nugetRegistrations = new[]
+        {
+            new NugetRegistration("App Service Nightly", "https://www.myget.org/F/azure-appservice/api/v3/index.json", "https://www.myget.org/feed/azure-appservice/package/nuget/{id}/{version}"),
+            new NugetRegistration("App Service Staging", "https://www.myget.org/F/azure-appservice-staging/api/v3/index.json", "https://www.myget.org/feed/azure-appservice-staging/package/nuget/{id}/{version}" ),
+            new NugetRegistration("Nuget.org", "https://api.nuget.org/v3/index.json" )
+        };
 
         // A function for quickly retrieving the latest versions of our packages across various
         // nuget sources. Good for determining next versions.
@@ -49,15 +51,9 @@ namespace FunctionsBuildHelper
             IList<NugetSourceResult> results = new List<NugetSourceResult>();
             IList<Task<NugetSourceResult>> tasks = new List<Task<NugetSourceResult>>();
 
-            bool preRelease = false;
-            if (bool.TryParse(req.Query["preRelease"], out bool preReleaseQuery))
+            foreach (var source in nugetRegistrations)
             {
-                preRelease = preReleaseQuery;
-            }
-
-            foreach (var source in nugetSources)
-            {
-                tasks.Add(GetResult(source.Key, source.Value, preRelease));
+                tasks.Add(GetResult(source));
             }
 
             await Task.WhenAll(tasks);
@@ -70,16 +66,15 @@ namespace FunctionsBuildHelper
             return new JsonResult(results);
         }
 
-        private static async Task<NugetSourceResult> GetResult(string sourceName, string sourceUri, bool preRelease)
+        private static async Task<NugetSourceResult> GetResult(NugetRegistration registration)
         {
-            var result = new NugetSourceResult(sourceName, sourceUri);
-            string searchUri = await GetSearchUri(sourceUri);
+            NugetSourceResult result = await GetNugetSource(registration);
 
             IList<Task<NugetPackage>> tasks = new List<Task<NugetPackage>>();
 
             foreach (var package in packageNames)
             {
-                tasks.Add(GetLatestVersion(searchUri, package, preRelease));
+                tasks.Add(GetLatestVersion(result.SearchUrl, package, result.PackageDetailsUrlTemplate));
             }
 
             await Task.WhenAll(tasks);
@@ -92,46 +87,68 @@ namespace FunctionsBuildHelper
             return result;
         }
 
-        private static async Task<NugetPackage> GetLatestVersion(string searchUri, string packageName, bool preRelease)
+        private static async Task<NugetPackage> GetLatestVersion(string searchUri, string packageName, string packageDetailsUriTemplate)
         {
-            string latestVersion = null;
-            HttpResponseMessage response = await _client.GetAsync($"{searchUri}?q=PackageId:{packageName}&prerelease={preRelease}");
-            var responseData = await response.Content.ReadAsAsync<JObject>();
-            JArray data = responseData["data"] as JArray;
-
-            // Some of our feeds may not have the package currently
-            if (data.Any())
+            // call it twice; once for prerelease, once not
+            async Task<string> GetLatestVersion(bool preRelease)
             {
-                JArray versions = data.Single()["versions"] as JArray;
-                var last = versions.OrderBy(p => p["version"]).Last()["version"];
-                latestVersion = last.ToString();
+                string latestVersion = null;
+
+                HttpResponseMessage response = await _client.GetAsync($"{searchUri}?q=PackageId:{packageName}&prerelease={preRelease}");
+                var responseData = await response.Content.ReadAsAsync<JObject>();
+                JArray data = responseData["data"] as JArray;
+
+                // Some of our feeds may not have the package currently
+                if (data.Any())
+                {
+                    JArray versions = data.Single()["versions"] as JArray;
+                    var last = versions.OrderBy(p => p["version"]).Last()["version"];
+                    latestVersion = last.ToString();
+                }
+
+                return latestVersion;
             }
 
-            return new NugetPackage(packageName, latestVersion);
+            string version = await GetLatestVersion(false);
+            string preReleaseVersion = await GetLatestVersion(true);
+
+            // construct uri to the main page of this package (no version)
+            string packageDetailsUri = packageDetailsUriTemplate.Replace("{id}", packageName).Replace("{version}", string.Empty).TrimEnd('/');
+
+            return new NugetPackage(packageName, version, preReleaseVersion, packageDetailsUri);
         }
 
-        private static async Task<string> GetSearchUri(string indexUri)
+        private static async Task<NugetSourceResult> GetNugetSource(NugetRegistration registration)
         {
-            HttpResponseMessage response = await _client.GetAsync(indexUri);
+            HttpResponseMessage response = await _client.GetAsync(registration.ServiceUri);
             JObject responseData = await response.Content.ReadAsAsync<JObject>();
             JArray apis = responseData["resources"] as JArray;
             JToken searchApi = apis.First(p => p["@type"].ToString() == "SearchQueryService");
-            return searchApi["@id"].ToString();
+            JToken packageDetailsUriTemplateJson = apis.FirstOrDefault(p => p["@type"].ToString().StartsWith("PackageDetailsUriTemplate"));
+            string packageDetailsUriTemplate = packageDetailsUriTemplateJson == null ? registration.FallbackPackageDetailsUriTemplate : packageDetailsUriTemplateJson["@id"].ToString();
+
+            return new NugetSourceResult(registration.FriendlyName, registration.ServiceUri, searchApi["@id"].ToString(), packageDetailsUriTemplate);
         }
 
         private class NugetSourceResult
         {
             private IList<NugetPackage> _packages = new List<NugetPackage>();
 
-            public NugetSourceResult(string name, string url)
+            public NugetSourceResult(string name, string url, string searchUrl, string packageDetailsUrlTemplate)
             {
                 SourceName = name;
                 SourceUrl = url;
+                SearchUrl = searchUrl;
+                PackageDetailsUrlTemplate = packageDetailsUrlTemplate;
             }
 
-            public string SourceName { get; set; }
+            public string SourceName { get; private set; }
 
-            public string SourceUrl { get; set; }
+            public string SourceUrl { get; private set; }
+
+            public string SearchUrl { get; private set; }
+
+            public string PackageDetailsUrlTemplate { get; private set; }
 
             public NugetPackage[] Packages => _packages.ToArray();
 
@@ -143,15 +160,42 @@ namespace FunctionsBuildHelper
 
         private class NugetPackage
         {
-            public NugetPackage(string name, string newestVersion)
+            public NugetPackage(string name, string newestVersion, string newestPreReleaseVersion, string packageUri)
             {
                 Name = name;
                 NewestVersion = newestVersion;
+                NewestPreReleaseVersion = newestPreReleaseVersion;
+                PackageUri = new Uri(packageUri);
             }
 
-            public string Name { get; set; }
+            public string Name { get; private set; }
 
-            public string NewestVersion { get; set; }
+            public string NewestVersion { get; private set; }
+
+            public string NewestPreReleaseVersion { get; private set; }
+
+            public Uri PackageUri { get; private set; }
+        }
+
+        private class NugetRegistration
+        {
+            public NugetRegistration(string friendlyName, string serviceUri, string fallbackPackageDetailsUriTemplate = null)
+            {
+                FriendlyName = friendlyName;
+                ServiceUri = serviceUri;
+                FallbackPackageDetailsUriTemplate = fallbackPackageDetailsUriTemplate;
+            }
+
+            public string FriendlyName { get; private set; }
+
+
+            public string ServiceUri { get; private set; }
+
+            /// <summary>
+            /// Used to generate the browseable Uri link to the package. MyGet doesn't contain this in its
+            /// service feed, but Nuget.org does. Needs to be in the format "https://site.org/{id}/{version}"
+            /// </summary>
+            public string FallbackPackageDetailsUriTemplate { get; private set; }
         }
     }
 }
